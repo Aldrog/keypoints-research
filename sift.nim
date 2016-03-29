@@ -1,11 +1,18 @@
 import 
-    math, sequtils, colors, gdk_pixbuf, pixbuf_helper
+    math, sequtils, gdk_pixbuf, pixbuf_helper, threadpool
+import processes
+
+var octaveCount: int
+var pChannel*: Channel[EvProcessProgress[seq[tuple[x, y: int]]]]
+pChannel.open()
 
 proc brightness(c: tuple[r, g, b: range[0..255]]): float =
     toFloat(c.r + c.g + c.b)
 
 type BMap = seq[seq[float]]
-type Octave = seq[BMap]
+type Octave = tuple
+    dog: seq[BMap]
+    scale: int
 
 proc newBMap(w, h: int): BMap =
     newSeqWith(h, newSeq[float](w))
@@ -15,8 +22,9 @@ proc width(bm: BMap): int =
 proc height(bm: BMap): int =
     bm.len
 
-proc newOctave(n, w, h: int): Octave =
-    newSeqWith(n, newBMap(w, h))
+proc newOctave(n, w, h, sc: int): Octave =
+    result.dog = newSeqWith(n, newBMap(w, h))
+    result.scale = sc
 
 proc multiplyBrightness(c: tuple[r, g, b: range[0..255]],
                         coef: float): tuple[r, g, b: range[0..255]] =
@@ -52,7 +60,7 @@ proc gaussianCoef(img: BMap; x, y: int; radius: float): float =
     gBrightness /= 2 * PI * pow(radius.float, 2)
     return gBrightness
 
-proc gaussianFilter*(img: GdkPixBuf, r: float) =
+proc gaussianFilter*(img: var GdkPixBuf, r: float) =
     var imgBMap = newBMap(img.width, img.height)
     for y in 0..<img.height:
         for x in 0..<img.width:
@@ -65,53 +73,68 @@ proc gaussianFilter*(img: GdkPixBuf, r: float) =
                 b: range[0..255] = r
             img[x, y] = (r, g, b)
 
-
-proc resample(img: BMap, k: int): BMap =
-    result = newBMap(toInt(img.width / k) + 1, toInt(img.height / k) + 1)
+proc resample(img: var BMap, k: int) =
+    var result = newBMap(ceil(img.width / k).int, ceil(img.height / k).int)
     for y in 0..<img.height:
         for x in 0..<img.width:
-            result[toInt(y / k)][toInt(x / k)] = img[y][x] / toFloat(k^2)
+            let 
+                resX = floor(x / k).int
+                resY = floor(y / k).int
+            var m = 1
+            if resX >= result.width - 1:
+                m *= k - (img.width mod k)
+            else:
+                m *= k
+            if floor(y / k).int == result.height - 1:
+                m *= k - (img.height mod k)
+            else:
+                m *= k
+            result[resY][resX] += img[y][x] / toFloat(m)
+    img = result
 
-proc buildOctaves(img: BMap, N: int, k: float): seq[Octave] =
-    result.newSeq(0)
-    const sigma0 = 1.6
+proc buildOctave(oct: ptr Octave; img: BMap; N: int; sigma, k: float; scale: int) {.thread.} =
+    oct[] = newOctave(N, img.width, img.height, scale)
+    for i in 0..N:
+        for y in 0..<img.height:
+            for x in 0..<img.width:
+                let g = gaussianCoef(img, x, y, sigma * pow(k, (i+1).float))
+                if i < N:
+                    oct.dog[i][y][x] += g
+                if i > 0:
+                    oct.dog[i - 1][y][x] -= g
+
+proc buildOctaves(img: BMap; N: int; sigma0, k: float): seq[Octave] =
+    result.newSeq(ceil(log2(min(img.width, img.height).float)).int)
+    octaveCount = 0
     var sigma = sigma0
     var curImg = img
-    while true:
-        if min(curImg.width, curImg.height) <= 10:
-            return
-        var octave = newOctave(N, curImg.width, curImg.height)
-        for i in 0..N:
-            for y in 0..<curImg.height:
-                for x in 0..<curImg.width:
-                    let g = gaussianCoef(curImg, x, y, sigma * pow(k, (i+1).float))
-                    if i < N:
-                        octave[i][y][x] += g
-                    if i > 0:
-                        octave[i - 1][y][x] -= g
-        result.add(octave)
-        curImg = resample(curImg, 2)
+    var curScale = 1
+    for i in 0..result.high:
+        buildOctave(addr result[i], curImg, N, sigma, k, curScale)
         sigma *= 2
+        curImg.resample(2)
+        curScale *= 2
+        let ev = EvProcessProgress[seq[tuple[x, y: int]]](completed: false,
+                                                          progress: i / result.len)
+        pChannel.send(ev)
 
-proc siftPoints*(img: GdkPixBuf): seq[tuple[x, y: int]] =
-    result.newSeq(0)
-    const N = 8
-    const k = pow(2, 1/N)
+proc siftPoints*(img: GdkPixBuf; octaveSize: int; startRadius, radiusStep: float) {.thread.} =
+    var result = newSeq[tuple[x, y: int]](0)
     var imgBMap = newBMap(img.width, img.height)
     for y in 0..<img.height:
         for x in 0..<img.width:
             imgBMap[y][x] = img[x, y].brightness
-    let octaves = buildOctaves(imgBMap, N, k)
+    let octaves = buildOctaves(imgBMap, octaveSize, startRadius, radiusStep)
     for oct in octaves:
-        for i in 1..<(N - 1):
-            for y in 1..<(oct[0].height - 1):
-                for x in 1..<(oct[0].width - 1):
+        for i in 1..<(octaveSize - 1):
+            for y in 1..<(oct.dog[0].height - 1):
+                for x in 1..<(oct.dog[0].width - 1):
                     var kp = true
                     for di in -1..1:
                         for dx in -1..1:
                             for dy in -1..1:
                                 if (di != 0 or dx != 0 or dy != 0) and
-                                        oct[i][y][x] <= oct[i + di][y + dy][x + dx]:
+                                        oct.dog[i][y][x] <= oct.dog[i + di][y + dy][x + dx]:
                                     kp = false
                     if kp:
                         result.add((x, y))
@@ -121,16 +144,12 @@ proc siftPoints*(img: GdkPixBuf): seq[tuple[x, y: int]] =
                             for dx in -1..1:
                                 for dy in -1..1:
                                     if (di != 0 or dx != 0 or dy != 0) and
-                                            oct[i][y][x] >= oct[i + di][y + dy][x + dx]:
+                                            oct.dog[i][y][x] >= oct.dog[i + di][y + dy][x + dx]:
                                         kp = false
                         if kp:
-                            result.add((x, y))
-                    if kp: echo x, " ", y
-    for y in 0..<img.height:
-        for x in 0..<img.width:
-            let
-                r: range[0..255] = (octaves[0][N - 1][y][x] / 3).int + 127
-                g: range[0..255] = (octaves[0][N - 1][y][x] / 3).int + 127
-                b: range[0..255] = (octaves[0][N - 1][y][x] / 3).int + 127
-            #img[x, y] = (r, g, b)
+                            result.add((x * oct.scale, y * oct.scale))
+                    #if kp: echo x, " ", y
+    echo "Finished"
+    let ev = EvProcessProgress[seq[tuple[x, y: int]]](completed: true, res: result)
+    pChannel.send(ev)
 
